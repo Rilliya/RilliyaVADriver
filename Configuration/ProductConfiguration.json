@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "productName": "RilliyaVADriver",
+  "bundleIdentifier": "moe.uwucocoa.rilliya.virtual-audio-driver",
+  "packageIdentifier": "moe.uwucocoa.rilliya.virtual-audio-driver.pkg",
+  "factoryUUID": "961AA42D-4018-4A54-81A5-AF308770CF08",
+  "factorySymbol": "RilliyaVADriverFactory",
+  "manufacturerName": "Rilliya",
+  "plugInName": "Rilliya Virtual Audio",
+  "modelUID": "moe.uwucocoa.rilliya.virtual-audio",
+  "deviceUIDPrefix": "moe.uwucocoa.rilliya.virtual.",
+  "catalogStorageKey": "moe.uwucocoa.rilliya.virtual.catalog.v1",
+  "internalDeviceNamePrefix": "Rilliya Internal "
+}

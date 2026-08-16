@@ -1,0 +1,4 @@
+// Generated from Configuration/ProductConfiguration.json. Do not edit directly.
+PRODUCT_BUNDLE_IDENTIFIER = moe.uwucocoa.rilliya.virtual-audio-driver
+PRODUCT_NAME = RilliyaVADriver
+RILLIYA_VA_DRIVER_PACKAGE_IDENTIFIER = moe.uwucocoa.rilliya.virtual-audio-driver.pkg
