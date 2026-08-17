@@ -17,12 +17,15 @@
 namespace {
 
 using rilliya::audio_driver::createDriverCatalogPropertyList;
+using rilliya::audio_driver::decodeDriverCatalog;
+using rilliya::audio_driver::DriverCatalogDecodeResult;
 using rilliya::audio_driver::DriverEndpointCatalog;
 using rilliya::audio_driver::endpointCatalogProperty;
 using rilliya::audio_driver::EndpointDefinition;
 using rilliya::audio_driver::EndpointDirection;
 using rilliya::audio_driver::EndpointIdentifier;
 using rilliya::audio_driver::PublishedEndpoint;
+using rilliya::audio_driver::resetDriverStateForTesting;
 namespace product_configuration = rilliya::audio_driver::product_configuration;
 
 class TestFailure final : public std::runtime_error {
@@ -131,6 +134,18 @@ void setCatalog(AudioServerPlugInDriverRef driver, const DriverEndpointCatalog& 
   expect(status == expectedStatus, "catalog setter should return expected status");
 }
 
+/// Reads back the catalog the driver reports, which is what the application asks it for.
+CFDictionaryRef catalogProperty(AudioServerPlugInDriverRef driver) {
+  const AudioObjectPropertyAddress catalogAddress = address(endpointCatalogProperty);
+  CFPropertyListRef value = nullptr;
+  UInt32 dataSize = 0;
+  const OSStatus status =
+      (*driver)->GetPropertyData(driver, kAudioObjectPlugInObject, 0, &catalogAddress, 0, nullptr,
+                                 sizeof(value), &dataSize, &value);
+  expect(status == noErr, "catalog getter should succeed");
+  return static_cast<CFDictionaryRef>(value);
+}
+
 std::vector<AudioObjectID> deviceList(AudioServerPlugInDriverRef driver) {
   const AudioObjectPropertyAddress listAddress = address(kAudioPlugInPropertyDeviceList);
   UInt32 dataSize = 0;
@@ -228,9 +243,81 @@ void testCatalogPublishesVisibleAndHiddenPairs() {
          "stream should expose native packed Float32 PCM");
 }
 
+/// A driver that is loaded again must publish the endpoints it was told about before.
+///
+/// coreaudiod restarts whenever a driver is installed, a machine wakes, or anything else asks it
+/// to, and every restart loads the plug-in afresh. The catalog is written to host storage for
+/// exactly this reason, so what matters is not that the storage is written but that a new instance
+/// reading it back ends up publishing the same devices.
+///
+/// The tests around this one drive one instance from an empty start. The seam between "the
+/// catalog was stored" and "a new instance publishes it" is what this covers, and it is where a
+/// catalog that restored while its devices did not was able to hide.
+void testStoredCatalogSurvivesAReload() {
+  {
+    AudioServerPlugInDriverRef driver = requireDriver();
+    expect((*driver)->Initialize(driver, &fakeHost) == noErr, "driver should initialize");
+    setCatalog(driver, DriverEndpointCatalog{
+                           .revision = 2,
+                           .endpoints = {endpoint(1, "Virtual Input", EndpointDirection::input)},
+                       });
+    expect(deviceList(driver).size() == 2, "one endpoint should publish its device pair");
+    expect(fakeHostState.storage != nullptr, "the catalog should reach host storage");
+  }
+
+  // The driver is a process-wide singleton, so asking the factory again returns the same state.
+  // Clearing it is what stands in for coreaudiod loading the plug-in afresh; without this the
+  // second Initialize would simply find the catalog still in memory and prove nothing.
+  resetDriverStateForTesting();
+  expect(deviceList(requireDriver()).empty(), "a reset driver should publish nothing");
+
+  AudioServerPlugInDriverRef reloaded = requireDriver();
+  expect((*reloaded)->Initialize(reloaded, &fakeHost) == noErr,
+         "reloaded driver should initialize");
+
+  expect(deviceList(reloaded).size() == 2,
+         "a reloaded driver should publish the endpoints it stored, not an empty device list");
+
+  const CFDictionaryRef restored = catalogProperty(reloaded);
+  expect(restored != nullptr, "a reloaded driver should report the catalog it stored");
+  const DriverCatalogDecodeResult decoded = decodeDriverCatalog(restored);
+  CFRelease(restored);
+  expect(static_cast<bool>(decoded), "the restored catalog should decode");
+  expect(decoded.catalog.revision == 2, "the restored catalog should keep its revision");
+  expect(decoded.catalog.endpoints.size() == 1, "the restored catalog should keep its endpoint");
+
+  // What the catalog says and what the device list publishes must agree: reporting an endpoint
+  // while publishing no device is the shape this failure took.
+  expect(deviceList(reloaded).size() == decoded.catalog.endpoints.size() * 2,
+         "the published devices should match the endpoints the catalog reports");
+
+  // The fake host's storage outlives one test, and a revision left behind here would be refused
+  // as stale by whichever test runs next.
+  deleteFromStorage(nullptr, nullptr);
+  resetDriverStateForTesting();
+}
+
+/// Replays the exact sequence coreaudiod runs before it will publish a device.
+///
+/// Captured from a live macOS host: plug-in custom properties, the device list, then per device
+/// its class, UID and streams in both scopes, then a stream's available physical formats, and
+/// finally its control list. A driver may answer "none" to any of these, but refusing one stops
+/// the walk: the plug-in loads, reports its devices, and the host silently publishes nothing,
+/// which is indistinguishable from a driver that never started.
 void testUIDTranslationAndDirectionSpecificProperties() {
+  // Establishes what it needs rather than inheriting whatever ran before it. The driver is a
+  // process-wide singleton, so a test that reads devices it did not publish passes or fails on
+  // the order the tests happen to run in.
+  resetDriverStateForTesting();
   AudioServerPlugInDriverRef driver = requireDriver();
+  expect((*driver)->Initialize(driver, &fakeHost) == noErr, "driver should initialize");
+  setCatalog(driver, DriverEndpointCatalog{
+                         .revision = 1,
+                         .endpoints = {endpoint(1, "Remote Microphone", EndpointDirection::input),
+                                       endpoint(2, "Broadcast Mix", EndpointDirection::output)},
+                     });
   const std::vector<AudioObjectID> devices = deviceList(driver);
+  expect(devices.size() == 4, "the catalog this test set should publish four devices");
   const AudioObjectID inputStreamObjectID = devices[0] + 1;
   const AudioServerPlugInClientInfo clientInfo{};
   const AudioServerPlugInIOCycleInfo cycleInfo{};
@@ -333,6 +420,7 @@ int main() {
   const TestCase tests[] = {
       {"discovers interface", testFactoryAndInterfaceDiscovery},
       {"publishes device pairs", testCatalogPublishesVisibleAndHiddenPairs},
+      {"restores a stored catalog on reload", testStoredCatalogSurvivesAReload},
       {"translates device UIDs", testUIDTranslationAndDirectionSpecificProperties},
       {"bridges realtime IO", testRealtimeIOBridgesCompanionPair},
   };

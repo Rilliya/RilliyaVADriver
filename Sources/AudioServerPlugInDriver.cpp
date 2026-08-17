@@ -288,6 +288,18 @@ public:
     return ObjectContext{runtimes_.registry().endpoints()[address->endpointIndex], address->kind};
   }
 
+  /// Returns this to the state a freshly loaded driver has.
+  ///
+  /// A driver is a process-wide singleton, so a test cannot get a second one by asking the factory
+  /// again — which means nothing could cover what happens when coreaudiod loads the plug-in afresh
+  /// and it has to restore what it stored. This is that seam, and it existed unexercised.
+  void resetForTesting() {
+    std::lock_guard lock(stateMutex_);
+    (void)runtimes_.replace({});
+    catalog_ = DriverEndpointCatalog{};
+    host_ = nullptr;
+  }
+
   [[nodiscard]] std::vector<AudioObjectID> deviceList() const {
     std::lock_guard lock(stateMutex_);
     std::vector<AudioObjectID> devices;
@@ -511,6 +523,8 @@ DriverState& driverState() {
 }
 
 } // namespace
+
+void resetDriverStateForTesting() { driverState().resetForTesting(); }
 
 namespace {
 
