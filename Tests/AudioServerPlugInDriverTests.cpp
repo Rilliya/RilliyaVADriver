@@ -304,11 +304,84 @@ void testStoredCatalogSurvivesAReload() {
 /// finally its control list. A driver may answer "none" to any of these, but refusing one stops
 /// the walk: the plug-in loads, reports its devices, and the host silently publishes nothing,
 /// which is indistinguishable from a driver that never started.
+/// Returns both the driver and the host's storage to the state of a machine that never ran it.
+///
+/// The driver is a process-wide singleton and the fake host's storage outlives one test, so a test
+/// that only resets the driver still finds the previous test's catalog waiting in storage and
+/// restores it. Any test that then sets a catalog of its own is refused as a stale revision.
+void resetDriverAndStorage() {
+  resetDriverStateForTesting();
+  if (fakeHostState.storage != nullptr) {
+    CFRelease(fakeHostState.storage);
+    fakeHostState.storage = nullptr;
+  }
+}
+
+void testDeviceAnswersTheHostActivationWalk() {
+  resetDriverAndStorage();
+  AudioServerPlugInDriverRef driver = requireDriver();
+  expect((*driver)->Initialize(driver, &fakeHost) == noErr, "driver should initialize");
+  setCatalog(driver, DriverEndpointCatalog{
+                         .revision = 1,
+                         .endpoints = {endpoint(1, "Walked Input", EndpointDirection::input),
+                                       endpoint(2, "Walked Output", EndpointDirection::output)},
+                     });
+
+  const auto answers = [&](AudioObjectID objectID, AudioObjectPropertySelector selector,
+                           AudioObjectPropertyScope scope) {
+    const AudioObjectPropertyAddress propertyAddress = address(selector, scope);
+    UInt32 dataSize = 0;
+    return (*driver)->HasProperty(driver, objectID, 0, &propertyAddress) &&
+           (*driver)->GetPropertyDataSize(driver, objectID, 0, &propertyAddress, 0, nullptr,
+                                          &dataSize) == noErr;
+  };
+
+  expect(answers(kAudioObjectPlugInObject, kAudioObjectPropertyCustomPropertyInfoList,
+                 kAudioObjectPropertyScopeGlobal),
+         "the host asks the plug-in for its custom properties");
+  expect(answers(kAudioObjectPlugInObject, kAudioPlugInPropertyDeviceList,
+                 kAudioObjectPropertyScopeGlobal),
+         "the host asks the plug-in for its device list");
+
+  const std::vector<AudioObjectID> devices = deviceList(driver);
+  expect(devices.size() == 4, "the catalog this test set should publish four devices");
+  for (const AudioObjectID device : devices) {
+    expect(answers(device, kAudioObjectPropertyClass, kAudioObjectPropertyScopeGlobal),
+           "the host asks each device for its class");
+    expect(answers(device, kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal),
+           "the host asks each device for its UID");
+    expect(answers(device, kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput),
+           "the host asks each device for its input streams");
+    expect(answers(device, kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput),
+           "the host asks each device for its output streams");
+    expect(answers(device + 1, kAudioStreamPropertyAvailablePhysicalFormats,
+                   kAudioObjectPropertyScopeGlobal),
+           "the host asks each stream for its available physical formats");
+    expect(answers(device, kAudioObjectPropertyControlList, kAudioObjectPropertyScopeGlobal),
+           "a device that refuses its control list is never published");
+
+    UInt32 controlListSize = 1;
+    const AudioObjectPropertyAddress controlList =
+        address(kAudioObjectPropertyControlList, kAudioObjectPropertyScopeGlobal);
+    expect((*driver)->GetPropertyDataSize(driver, device, 0, &controlList, 0, nullptr,
+                                          &controlListSize) == noErr,
+           "control list size should be readable");
+    expect(controlListSize == 0, "these endpoints carry no controls");
+    UInt32 written = 1;
+    std::array<AudioObjectID, 1> unused{};
+    expect((*driver)->GetPropertyData(driver, device, 0, &controlList, 0, nullptr,
+                                      static_cast<UInt32>(unused.size() * sizeof(AudioObjectID)),
+                                      &written, unused.data()) == noErr,
+           "an empty control list should be readable");
+    expect(written == 0, "an empty control list should report no bytes");
+  }
+}
+
 void testUIDTranslationAndDirectionSpecificProperties() {
   // Establishes what it needs rather than inheriting whatever ran before it. The driver is a
   // process-wide singleton, so a test that reads devices it did not publish passes or fails on
   // the order the tests happen to run in.
-  resetDriverStateForTesting();
+  resetDriverAndStorage();
   AudioServerPlugInDriverRef driver = requireDriver();
   expect((*driver)->Initialize(driver, &fakeHost) == noErr, "driver should initialize");
   setCatalog(driver, DriverEndpointCatalog{
@@ -421,6 +494,7 @@ int main() {
       {"discovers interface", testFactoryAndInterfaceDiscovery},
       {"publishes device pairs", testCatalogPublishesVisibleAndHiddenPairs},
       {"restores a stored catalog on reload", testStoredCatalogSurvivesAReload},
+      {"answers the host activation walk", testDeviceAnswersTheHostActivationWalk},
       {"translates device UIDs", testUIDTranslationAndDirectionSpecificProperties},
       {"bridges realtime IO", testRealtimeIOBridgesCompanionPair},
   };

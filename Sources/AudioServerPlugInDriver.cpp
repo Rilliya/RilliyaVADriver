@@ -660,6 +660,10 @@ AudioServerPlugInDriverRef driverReference = &driverInterfacePointer;
   case kAudioDevicePropertyBufferFrameSizeRange:
   case kAudioDevicePropertyZeroTimeStampPeriod:
   case kAudioDevicePropertyClockIsStable:
+  // These endpoints carry no volume or mute controls, but the host asks anyway and stops
+  // activating a device that refuses the question rather than answering "none". Answering it is
+  // the difference between a device that appears and one that loads, publishes, and is dropped.
+  case kAudioObjectPropertyControlList:
     return true;
   default:
     return false;
@@ -897,6 +901,9 @@ OSStatus answerPropertyDataSize(AudioServerPlugInDriverRef driver, AudioObjectID
       *dataSize =
           scopeIncludesDirection(address->mScope, context->direction()) ? sizeof(AudioObjectID) : 0;
       return noErr;
+    case kAudioObjectPropertyControlList:
+      *dataSize = 0;
+      return noErr;
     case kAudioDevicePropertyRelatedDevices:
       *dataSize = 2 * sizeof(AudioObjectID);
       return noErr;
@@ -1041,6 +1048,8 @@ OSStatus answerPropertyData(AudioServerPlugInDriverRef driver, AudioObjectID obj
       const std::array<AudioObjectID, 1> stream{context->streamObjectID()};
       return writeObjectIDs(dataSize, outputDataSize, outputData, stream);
     }
+    case kAudioObjectPropertyControlList:
+      return writeObjectIDs(dataSize, outputDataSize, outputData, {});
     case kAudioDevicePropertyDeviceUID:
       return writeUTF8String(dataSize, outputDataSize, outputData, context->deviceUID());
     case kAudioDevicePropertyModelUID:
