@@ -146,6 +146,17 @@ CFDictionaryRef catalogProperty(AudioServerPlugInDriverRef driver) {
   return static_cast<CFDictionaryRef>(value);
 }
 
+/// How many streams a device presents in one scope, which is what says which way it faces.
+std::size_t streamCount(AudioServerPlugInDriverRef driver, AudioObjectID objectID,
+                        AudioObjectPropertyScope scope) {
+  const AudioObjectPropertyAddress streams = address(kAudioDevicePropertyStreams, scope);
+  UInt32 dataSize = 0;
+  expect((*driver)->GetPropertyDataSize(driver, objectID, 0, &streams, 0, nullptr, &dataSize) ==
+             noErr,
+         "stream list size should be readable");
+  return dataSize / sizeof(AudioObjectID);
+}
+
 std::vector<AudioObjectID> deviceList(AudioServerPlugInDriverRef driver) {
   const AudioObjectPropertyAddress listAddress = address(kAudioPlugInPropertyDeviceList);
   UInt32 dataSize = 0;
@@ -427,6 +438,78 @@ void testUIDTranslationAndDirectionSpecificProperties() {
   expect(outputDataSize == 0, "opposite scope should contain no stream");
 }
 
+/// The mirror of the input bridge, which nothing exercised.
+///
+/// A virtual output is the other direction end to end: another application plays into the visible
+/// output device and this application reads what it played from the hidden companion. Every part
+/// of it is the opposite of the input case — which device is visible, which side writes, which
+/// operation each side implements — so passing the input test says nothing about this one.
+void testRealtimeIOBridgesAnOutputEndpoint() {
+  resetDriverAndStorage();
+  AudioServerPlugInDriverRef driver = requireDriver();
+  expect((*driver)->Initialize(driver, &fakeHost) == noErr, "driver should initialize");
+  setCatalog(driver, DriverEndpointCatalog{
+                         .revision = 1,
+                         .endpoints = {endpoint(1, "Broadcast Mix", EndpointDirection::output)},
+                     });
+
+  const std::vector<AudioObjectID> devices = deviceList(driver);
+  expect(devices.size() == 2, "one output endpoint should publish a visible and a hidden device");
+  const AudioObjectID visibleOutput = devices[0];
+  const AudioObjectID hiddenReader = devices[1];
+
+  // The visible device of an output endpoint takes audio, and its companion gives it back.
+  expect(property<UInt32>(driver, visibleOutput, kAudioDevicePropertyIsHidden) == 0,
+         "the output endpoint's visible device should be visible");
+  expect(property<UInt32>(driver, hiddenReader, kAudioDevicePropertyIsHidden) == 1,
+         "the reader companion should stay hidden");
+  expect(streamCount(driver, visibleOutput, kAudioObjectPropertyScopeOutput) == 1,
+         "a virtual output should present one output stream");
+  expect(streamCount(driver, visibleOutput, kAudioObjectPropertyScopeInput) == 0,
+         "a virtual output should present no input stream");
+  expect(streamCount(driver, hiddenReader, kAudioObjectPropertyScopeInput) == 1,
+         "the reader companion should present one input stream");
+
+  constexpr UInt32 playingClient = 21;
+  constexpr UInt32 readingClient = 22;
+  expect((*driver)->StartIO(driver, visibleOutput, playingClient) == noErr,
+         "visible output client should start");
+  expect((*driver)->StartIO(driver, hiddenReader, readingClient) == noErr,
+         "hidden reader client should start");
+
+  Boolean willDo = false;
+  Boolean inPlace = false;
+  expect((*driver)->WillDoIOOperation(driver, visibleOutput, playingClient,
+                                      kAudioServerPlugInIOOperationWriteMix, &willDo,
+                                      &inPlace) == noErr &&
+             willDo && inPlace,
+         "the visible output should implement in-place WriteMix");
+
+  std::vector<float> source{0.25F, -0.75F, 1.0F, -0.125F};
+  const AudioServerPlugInIOCycleInfo cycle{};
+  expect((*driver)->DoIOOperation(driver, visibleOutput, visibleOutput + 1, playingClient,
+                                  kAudioServerPlugInIOOperationWriteMix, 2, &cycle, source.data(),
+                                  nullptr) == noErr,
+         "the visible output should accept what another application plays");
+  std::vector<float> destination(4);
+  expect((*driver)->DoIOOperation(driver, hiddenReader, hiddenReader + 1, readingClient,
+                                  kAudioServerPlugInIOOperationReadInput, 2, &cycle,
+                                  destination.data(), nullptr) == noErr,
+         "the reader companion should provide what was played");
+  expect(destination == source, "an output endpoint should preserve every interleaved sample");
+
+  // The directions are not interchangeable: reading the device that takes audio is wrong.
+  expect((*driver)->DoIOOperation(driver, visibleOutput, visibleOutput + 1, playingClient,
+                                  kAudioServerPlugInIOOperationReadInput, 2, &cycle,
+                                  destination.data(), nullptr) != noErr,
+         "reading a virtual output's visible device should be refused");
+
+  expect((*driver)->StopIO(driver, hiddenReader, readingClient) == noErr,
+         "hidden reader should stop");
+  expect((*driver)->StopIO(driver, visibleOutput, playingClient) == noErr,
+         "visible output should stop");
+}
+
 void testRealtimeIOBridgesCompanionPair() {
   AudioServerPlugInDriverRef driver = requireDriver();
   const std::vector<AudioObjectID> devices = deviceList(driver);
@@ -497,6 +580,7 @@ int main() {
       {"answers the host activation walk", testDeviceAnswersTheHostActivationWalk},
       {"translates device UIDs", testUIDTranslationAndDirectionSpecificProperties},
       {"bridges realtime IO", testRealtimeIOBridgesCompanionPair},
+      {"bridges an output endpoint", testRealtimeIOBridgesAnOutputEndpoint},
   };
 
   std::size_t failureCount = 0;
