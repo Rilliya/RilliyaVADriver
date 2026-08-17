@@ -6,6 +6,7 @@
 #include <CoreAudio/AudioHardware.h>
 #include <CoreFoundation/CFPlugInCOM.h>
 #include <mach/mach_time.h>
+#include <os/log.h>
 
 #include <algorithm>
 #include <array>
@@ -29,6 +30,17 @@ namespace {
 constexpr std::uint32_t defaultBufferFrameSize = 512;
 constexpr std::uint32_t zeroTimestampPeriod = 16384;
 constexpr std::size_t devicesPerEndpoint = 2;
+
+/// The one way to see inside this plug-in.
+///
+/// It runs inside coreaudiod, which cannot be attached to and whose failures are otherwise silent:
+/// a catalog that does not come back after a restart looks exactly like one that was never stored.
+/// Every branch that ends with devices not being published says why here.
+[[nodiscard]] os_log_t driverLog() {
+  static const std::string subsystem(product_configuration::bundleIdentifier);
+  static os_log_t log = os_log_create(subsystem.c_str(), "driver");
+  return log;
+}
 
 [[nodiscard]] AudioStreamBasicDescription streamFormat(const EndpointDefinition& definition) {
   const UInt32 bytesPerFrame = static_cast<UInt32>(sizeof(float)) * definition.channelCount;
@@ -232,20 +244,38 @@ public:
       host_ = host;
     }
 
-    CFPropertyListRef stored = nullptr;
-    if (host->CopyFromStorage != nullptr &&
-        host->CopyFromStorage(host, product_configuration::catalogStorageKey, &stored) == noErr &&
-        stored != nullptr) {
-      const DriverCatalogDecodeResult decoded = decodeDriverCatalog(stored);
-      CFRelease(stored);
-      if (decoded) {
-        std::lock_guard lock(stateMutex_);
-        if (runtimes_.replace(decoded.catalog.endpoints)) {
-          catalog_ = decoded.catalog;
-          configureClocks();
-        }
-      }
+    if (host->CopyFromStorage == nullptr) {
+      os_log_error(driverLog(), "initialize: host offers no storage, starting with no endpoints");
+      return noErr;
     }
+    CFPropertyListRef stored = nullptr;
+    const OSStatus storageStatus =
+        host->CopyFromStorage(host, product_configuration::catalogStorageKey, &stored);
+    if (storageStatus != noErr || stored == nullptr) {
+      os_log(driverLog(), "initialize: no stored catalog (status %d), starting with no endpoints",
+             storageStatus);
+      return noErr;
+    }
+
+    const DriverCatalogDecodeResult decoded = decodeDriverCatalog(stored);
+    CFRelease(stored);
+    if (!decoded) {
+      os_log_error(driverLog(), "initialize: stored catalog rejected (error %d, endpoint %zu)",
+                   static_cast<int>(decoded.error), decoded.endpointIndex);
+      return noErr;
+    }
+
+    std::lock_guard lock(stateMutex_);
+    const DriverRuntimeResult result = runtimes_.replace(decoded.catalog.endpoints);
+    if (!result) {
+      os_log_error(driverLog(), "initialize: stored catalog revision %llu not published (error %d)",
+                   decoded.catalog.revision, static_cast<int>(result.error));
+      return noErr;
+    }
+    catalog_ = decoded.catalog;
+    configureClocks();
+    os_log(driverLog(), "initialize: restored catalog revision %llu, publishing %zu devices",
+           catalog_.revision, runtimes_.registry().endpoints().size() * devicesPerEndpoint);
     return noErr;
   }
 
@@ -338,6 +368,8 @@ public:
       return storageStatus;
     }
 
+    os_log(driverLog(), "setCatalog: published revision %llu as %zu devices, notifying host",
+           decoded.catalog.revision, decoded.catalog.endpoints.size() * devicesPerEndpoint);
     notifyDeviceListChanged(host);
     return noErr;
   }
@@ -477,6 +509,10 @@ DriverState& driverState() {
   static DriverState state;
   return state;
 }
+
+} // namespace
+
+namespace {
 
 std::atomic<ULONG> referenceCount{1};
 
@@ -742,9 +778,36 @@ OSStatus isPropertySettable(AudioServerPlugInDriverRef driver, AudioObjectID obj
   return noErr;
 }
 
-OSStatus getPropertyDataSize(AudioServerPlugInDriverRef driver, AudioObjectID objectID, pid_t,
-                             const AudioObjectPropertyAddress* address, UInt32, const void*,
-                             UInt32* dataSize) {
+/// Records one property call, so a device that the host asks about can be told apart from one it
+/// never looks at.
+///
+/// Off unless debug logging is enabled for this subsystem, which is where a question like "did the
+/// host ever ask about this object" has to be answered: the plug-in is the only party that knows.
+void traceProperty(const char* operation, AudioObjectID objectID,
+                   const AudioObjectPropertyAddress* address, OSStatus status) {
+  if (address == nullptr) {
+    return;
+  }
+  const auto fourCharCode = [](std::uint32_t value, std::array<char, 5>& text) {
+    for (std::size_t index = 0; index < 4; ++index) {
+      const char character = static_cast<char>((value >> (24 - index * 8)) & 0xFF);
+      text[index] = (character >= 32 && character <= 126) ? character : '.';
+    }
+    text[4] = '\0';
+  };
+  std::array<char, 5> selector{};
+  std::array<char, 5> scope{};
+  std::array<char, 5> result{};
+  fourCharCode(address->mSelector, selector);
+  fourCharCode(address->mScope, scope);
+  fourCharCode(static_cast<std::uint32_t>(status), result);
+  os_log_debug(driverLog(), "%{public}s object %u '%{public}s'/'%{public}s' -> '%{public}s'",
+               operation, objectID, selector.data(), scope.data(), result.data());
+}
+
+OSStatus answerPropertyDataSize(AudioServerPlugInDriverRef driver, AudioObjectID objectID, pid_t,
+                                const AudioObjectPropertyAddress* address, UInt32, const void*,
+                                UInt32* dataSize) {
   if (!isValidDriver(driver)) {
     return kAudioHardwareBadObjectError;
   }
@@ -770,9 +833,11 @@ OSStatus getPropertyDataSize(AudioServerPlugInDriverRef driver, AudioObjectID ob
       *dataSize = sizeof(CFTypeRef);
       return noErr;
     case kAudioObjectPropertyOwnedObjects:
-    case kAudioPlugInPropertyDeviceList:
-      *dataSize = static_cast<UInt32>(driverState().deviceList().size() * sizeof(AudioObjectID));
+    case kAudioPlugInPropertyDeviceList: {
+      const std::size_t count = driverState().deviceList().size();
+      *dataSize = static_cast<UInt32>(count * sizeof(AudioObjectID));
       return noErr;
+    }
     case kAudioObjectPropertyCustomPropertyInfoList:
       *dataSize = sizeof(AudioServerPlugInCustomPropertyInfo);
       return noErr;
@@ -867,10 +932,10 @@ OSStatus getPropertyDataSize(AudioServerPlugInDriverRef driver, AudioObjectID ob
   }
 }
 
-OSStatus getPropertyData(AudioServerPlugInDriverRef driver, AudioObjectID objectID, pid_t,
-                         const AudioObjectPropertyAddress* address, UInt32 qualifierDataSize,
-                         const void* qualifierData, UInt32 dataSize, UInt32* outputDataSize,
-                         void* outputData) {
+OSStatus answerPropertyData(AudioServerPlugInDriverRef driver, AudioObjectID objectID, pid_t,
+                            const AudioObjectPropertyAddress* address, UInt32 qualifierDataSize,
+                            const void* qualifierData, UInt32 dataSize, UInt32* outputDataSize,
+                            void* outputData) {
   if (!isValidDriver(driver)) {
     return kAudioHardwareBadObjectError;
   }
@@ -1084,6 +1149,27 @@ OSStatus getPropertyData(AudioServerPlugInDriverRef driver, AudioObjectID object
   default:
     return kAudioHardwareUnknownPropertyError;
   }
+}
+
+OSStatus getPropertyDataSize(AudioServerPlugInDriverRef driver, AudioObjectID objectID,
+                             pid_t clientProcessID, const AudioObjectPropertyAddress* address,
+                             UInt32 qualifierDataSize, const void* qualifierData,
+                             UInt32* dataSize) {
+  const OSStatus status = answerPropertyDataSize(driver, objectID, clientProcessID, address,
+                                                 qualifierDataSize, qualifierData, dataSize);
+  traceProperty("GetPropertyDataSize", objectID, address, status);
+  return status;
+}
+
+OSStatus getPropertyData(AudioServerPlugInDriverRef driver, AudioObjectID objectID,
+                         pid_t clientProcessID, const AudioObjectPropertyAddress* address,
+                         UInt32 qualifierDataSize, const void* qualifierData, UInt32 dataSize,
+                         UInt32* outputDataSize, void* outputData) {
+  const OSStatus status =
+      answerPropertyData(driver, objectID, clientProcessID, address, qualifierDataSize,
+                         qualifierData, dataSize, outputDataSize, outputData);
+  traceProperty("GetPropertyData", objectID, address, status);
+  return status;
 }
 
 OSStatus setPropertyData(AudioServerPlugInDriverRef driver, AudioObjectID objectID, pid_t,
