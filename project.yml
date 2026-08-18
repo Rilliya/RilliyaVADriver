@@ -33,7 +33,7 @@ targets:
         INFOPLIST_FILE: Resources/Info.plist
         INSTALL_PATH: /Library/Audio/Plug-Ins/HAL
         MACH_O_TYPE: mh_bundle
-        MARKETING_VERSION: 0.1.0
+        MARKETING_VERSION: 0.1.0-alpha.1
         SKIP_INSTALL: NO
         WRAPPER_EXTENSION: driver
       configs:
